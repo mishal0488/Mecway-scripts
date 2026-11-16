@@ -1,4 +1,4 @@
-# Straighten Surface Node Path — v2.0.0
+# Straighten Surface Node Path — v2.1.0
 
 **Author:** Mishal Mohanlal  
 **Runtime:** Mecway built-in IronPython 2.7  
@@ -25,7 +25,7 @@ This makes the output useful as the basis of a beam layout: the aligned nodes ar
 4. Enter the two mesh **node IDs** marking the ends of the desired line. Both must belong to the selected faces and the same connected surface patch.
 5. Enter a **maximum search radius / node movement** in **metres**. The default (`0` or blank) uses approximately **1.2 times the local mesh pitch**. For instance, 20 mm is `0.02`, not `20`.
 6. Read the summary: selected node IDs, amount of movement, maximum longitudinal gap, and face-node distance ratio.
-7. Type **YES** to move the nodes or anything else to cancel. The endpoint nodes remain fixed.
+7. Click **Accept** to move the nodes, or **Cancel** to leave the model unchanged. Closing the dialog also cancels. The preview is read-only and scrollable. The endpoint nodes remain fixed.
 8. Inspect the mesh and add beam elements using the collinear nodes as needed. The script **does not create beams or modify existing element connectivity**.
 
 ## How it works
@@ -42,7 +42,7 @@ The selected faces may not connect the two anchors sufficiently, or the mesh sim
 
 ### Safeguards and limitations
 
-- No coordinates are changed until you confirm **YES**.
+- No coordinates are changed until you click **Accept** in the Windows confirmation dialog. The **Cancel** button and closing the dialog leave the model unchanged.
 - The algorithm rejects a line with large missing longitudinal gaps relative to the estimated mesh pitch.
 - Selected nodes cannot be projected nearly onto one another; a minimum along-line spacing is enforced.
 - It checks for very short inter-node distances within affected faces and tries to reject collapsed / reversed *tri3* or *quad4* face triangles.
@@ -56,3 +56,7 @@ The selected faces may not connect the two anchors sufficiently, or the mesh sim
 Run `python -m unittest discover -s tests -v` from the repository root. The test suite uses a simulated Mecway interface and includes irregular mesh stations, diagonal quadrilateral meshes, warped 3-D surfaces, confirmation handling, disconnected surfaces and collapse safeguards. This validates the geometric algorithm but does **not** substitute for live testing with your installed Mecway API.
 
 Relevant official references: [Mecway Manual — Automation](https://www.mecway.com/manual.pdf), [Mecway forum — face_nodes() and selected_faces()](https://mecway.com/forum/discussion/1020/python-api-scripts/p2), and **Help → API reference** in Mecway.
+
+## Version 2.1.0: button confirmation
+
+The free-text `YES` prompt was replaced by a native Windows Forms modal preview with **Accept** and **Cancel** buttons. No additional Mecway inputs are required. The confirmation dialog is shown only once all selection and mesh checks have completed.
