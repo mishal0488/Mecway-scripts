@@ -1,302 +1,484 @@
 # -*- coding: utf-8 -*-
-# Mecway embedded IronPython 2.7 script
-# Author: Mishal Mohanlal
-# Version: 1.0.0
-# Purpose: Straighten one connected row of surface mesh nodes between
-#          two existing endpoint nodes, without changing element connectivity.
-#
-# How to use:
-#   1. Save a backup copy of the model.
-#   2. Select the mesh faces making up the surface of interest in Mecway.
-#   3. Run this script from Mecway's Tools menu.
-#   4. Enter the start and end node IDs and an optional search tolerance in m.
-#   5. Inspect the proposed movement and type YES to apply.
-#
-# All coordinates and distance inputs are in metres (Mecway API SI units).
-# This is a MESH operation, not a modification of underlying CAD geometry.
-# The script deliberately does NOT create beam elements.
+"""Align nearby nodes of a user-selected Mecway mesh surface to a 3D line.
 
-import heapq
+Author: Mishal Mohanlal
+Version: 2.0.0
+Runtime: Mecway's embedded IronPython 2.7 (no external packages).
+
+This is a geometric row-finding tool, NOT an element-edge-chain finder:
+it chooses one nearby surface node per longitudinal station. These nodes can
+subsequently be connected by beam elements even if they did not originally
+share element edges.
+
+1. Back up the model.
+2. Select the MESH FACES of the surface where the line is required.
+3. Run script, supply start and end node IDs (both on selected faces).
+4. Give a search radius in METRES (0 = automatic, about one mesh pitch).
+5. Read the preview; type YES to move the identified intermediate nodes.
+
+Endpoints do not move, nor does this script create any elements. Projection
+onto the exact straight line may deform the surrounding mesh, especially if
+it is curved. Inspect the edited mesh before structural analysis.
+"""
+
 import math
 
-SCRIPT_NAME = "Straighten Surface Node Path"
-VERSION = "1.0.0"
-AUTO_TOLERANCE_FACTOR = 1.25
-LINE_PENALTY = 4.0
-MAX_REPORTED_NODES = 25
-
-
-def distance(a, b):
-    dx = a[0] - b[0]
-    dy = a[1] - b[1]
-    dz = a[2] - b[2]
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-
-def dot(a, b):
-    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+SCRIPT_NAME = 'Straighten Surface Node Path'
+VERSION = '2.0.0'
+AUTO_RADIUS_PITCH = 1.20
+# Minimum projected spacing between consecutive selected nodes.
+MIN_STEP_PITCH = 0.30
+# Maximum gap for a well-supported proposed line: a gap longer than this
+# indicates missing nearby mesh nodes; fail rather than skip a large area.
+MAX_GAP_PITCH = 2.75
+# Avoid quadratic work if too many nodes happen to be close to the line.
+MAX_CANDIDATES = 12000
+MAX_IDS_SHOWN = 24
+# A selected face should not develop a near-zero distance between any two of
+# its previously distinct nodes. Reject before moving anything.
+MIN_PAIR_DISTANCE_RATIO = 0.12
+MIN_ORIENTED_AREA_RATIO = 0.08
 
 
 def subtract(a, b):
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
-def node_position(node_id):
-    point = mw.node(node_id)
-    return (float(point.x), float(point.y), float(point.z))
+def add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
 
 
-def read_node_id(prompt):
-    answer = mw.input(prompt)
-    if answer is None or str(answer).strip() == "":
+def scale(a, amount):
+    return (a[0] * amount, a[1] * amount, a[2] * amount)
+
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def distance(a, b):
+    v = subtract(a, b)
+    return math.sqrt(dot(v, v))
+
+
+def median(numbers):
+    ordered = sorted(numbers)
+    count = len(ordered)
+    if not count:
+        raise ValueError('No usable mesh spacing could be determined.')
+    middle = count // 2
+    if count % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def node_location(node_id):
+    p = mw.node(node_id)
+    return (float(p.x), float(p.y), float(p.z))
+
+
+def prompt_node_id(message):
+    answer = mw.input(message)
+    if answer is None or str(answer).strip() == '':
         return None
     try:
-        node_id = int(str(answer).strip())
-    except (TypeError, ValueError):
-        raise ValueError("Node ID must be a positive whole number.")
-    if node_id <= 0:
-        raise ValueError("Node ID must be a positive whole number.")
-    return node_id
+        value = int(str(answer).strip())
+    except (ValueError, TypeError):
+        raise ValueError('Node numbers must be positive integers.')
+    if value <= 0:
+        raise ValueError('Node numbers must be positive integers.')
+    return value
 
 
-def median(values):
-    ordered = sorted(values)
-    count = len(ordered)
-    if count == 0:
-        raise ValueError("Cannot calculate mesh spacing: no node pairs.")
-    mid = count // 2
-    if count % 2:
-        return ordered[mid]
-    return 0.5 * (ordered[mid - 1] + ordered[mid])
+def prompt_radius():
+    value = mw.input('Maximum node movement / search radius in metres '
+                     '(0 or blank = automatic):')
+    if value is None:
+        return None
+    if str(value).strip() == '':
+        return 0.0
+    try:
+        result = float(str(value).strip())
+    except (ValueError, TypeError):
+        raise ValueError('Radius must be a valid distance in metres.')
+    if result < 0.0 or math.isnan(result) or math.isinf(result):
+        raise ValueError('Radius must be finite and >= 0.')
+    return result
 
 
-def surface_graph(faces):
-    """Use co-face node links; works without assuming tri/quad node ordering.
+def make_surface(faces):
+    """Return face node lists and adjacency used to isolate the surface.
 
-    A co-face link can cross a quad diagonally, so this finds a connected
-    geometric path, not necessarily a chain of existing mesh edges.
+    Unlike the v1 search, adjacency is NOT used as a shortcut edge/path.
+    Faces sharing any node belong to the same connected surface component.
     """
-    graph = {}
-    for face_id in faces:
-        face_nodes = list(mw.face_nodes(face_id))
-        # Remove duplicates (some face representations can repeat corners).
+    face_lists = []
+    adjacency = {}
+    for face in faces:
         unique = []
         seen = set()
-        for item in face_nodes:
-            node_id = int(item)
+        for node_id in mw.face_nodes(face):
+            node_id = int(node_id)
             if node_id not in seen:
-                seen.add(node_id)
                 unique.append(node_id)
-                if node_id not in graph:
-                    graph[node_id] = set()
-
-        # Link every pair in a face. This is deliberately not an assertion
-        # that the two nodes share an element edge.
-        for index, node_a in enumerate(unique):
-            for node_b in unique[index + 1:]:
-                graph[node_a].add(node_b)
-                graph[node_b].add(node_a)
-    return graph
-
-
-def projected_data(positions, start_id, end_id):
-    a = positions[start_id]
-    b = positions[end_id]
-    direction = subtract(b, a)
-    length_sq = dot(direction, direction)
-    if length_sq <= 0.0:
-        raise ValueError("The two endpoint nodes occupy the same location.")
-
-    data = {}
-    for node_id, point in positions.items():
-        t = dot(subtract(point, a), direction) / length_sq
-        foot = (a[0] + t * direction[0],
-                a[1] + t * direction[1],
-                a[2] + t * direction[2])
-        d = distance(point, foot)
-        data[node_id] = (t, d, foot)
-    return data, math.sqrt(length_sq)
-
-
-def estimate_spacing(graph, positions):
-    # A robust characteristic mesh pitch from each node's nearest
-    # co-face neighbour. Zero-length links are ignored.
-    near_lengths = []
-    for node_id, neighbours in graph.items():
-        lengths = [distance(positions[node_id], positions[other])
-                   for other in neighbours]
-        lengths = [value for value in lengths if value > 0.0]
-        if lengths:
-            near_lengths.append(min(lengths))
-    return median(near_lengths)
-
-
-def find_path(graph, positions, projection, start_id, end_id,
-              max_offset, spacing, length):
-    """Dijkstra: forward-only, close-to-line, face-connected path."""
-    # Disallow moves backwards along AB, otherwise a route can weave or
-    # repeatedly visit the same longitudinal station.
-    t_epsilon = 1.0e-10
-    best = {start_id: 0.0}
-    previous = {}
-    queue = [(0.0, start_id)]
-    while queue:
-        cost_here, here = heapq.heappop(queue)
-        if cost_here > best.get(here, float("inf")):
+                seen.add(node_id)
+                if node_id not in adjacency:
+                    adjacency[node_id] = set()
+        if len(unique) < 2:
             continue
-        if here == end_id:
-            break
-        t_here, d_here, unused = projection[here]
-        for there in graph[here]:
-            t_there, d_there, unused = projection[there]
-            if t_there <= t_here + t_epsilon:
-                continue
-            if t_there > 1.0 + t_epsilon:
-                continue
-            if d_there > max_offset + length * 1.0e-12:
-                continue
-            segment = distance(positions[here], positions[there])
-            if segment <= 0.0:
-                continue
-            mean_offset = 0.5 * (d_here + d_there)
-            # Prefer a near-line route; disfavor detours across the surface.
-            penalty = 1.0 + LINE_PENALTY * (mean_offset / spacing) ** 2
-            new_cost = cost_here + segment * penalty
-            if new_cost < best.get(there, float("inf")):
-                best[there] = new_cost
-                previous[there] = here
-                heapq.heappush(queue, (new_cost, there))
+        face_lists.append(unique)
+        # A face is a local surface neighbourhood (tri3, quad4, tri6, etc).
+        for index, a in enumerate(unique):
+            adjacency[a].update(unique[:index])
+            adjacency[a].update(unique[index + 1:])
+    return face_lists, adjacency
 
-    if end_id not in best:
+
+def component_containing(adjacency, start):
+    reached = set([start])
+    remaining = [start]
+    while remaining:
+        node_id = remaining.pop()
+        for other in adjacency[node_id]:
+            if other not in reached:
+                reached.add(other)
+                remaining.append(other)
+    return reached
+
+
+def estimate_pitch(positions, adjacency, component, ab, a, length):
+    """Estimate a representative LOCAL mesh pitch around the entire line.
+
+    Collect each node's nearest nonzero co-face distance. Limit sampling
+    to the line's bounding region to avoid distant fine mesh altering the
+    pitch. Use the whole component if too few local samples were found.
+    """
+    all_pitches = []
+    local_pitches = []
+    ab_unit = scale(ab, 1.0 / length)
+    for node_id in component:
+        p = positions[node_id]
+        nearest = None
+        for other in adjacency[node_id]:
+            if other not in component:
+                continue
+            value = distance(p, positions[other])
+            if value > 0.0 and (nearest is None or value < nearest):
+                nearest = value
+        if nearest is None:
+            continue
+        all_pitches.append(nearest)
+        s = dot(subtract(p, a), ab_unit)
+        closest = add(a, scale(ab_unit, s))
+        d = distance(p, closest)
+        if -2.0 * nearest <= s <= length + 2.0 * nearest and d <= 3.0 * nearest:
+            local_pitches.append(nearest)
+    values = local_pitches if len(local_pitches) >= 3 else all_pitches
+    return median(values)
+
+
+def candidate_points(positions, component, start, end, pitch, radius):
+    """Sorted points: (distance along AB, node ID, perpendicular vector, d).
+
+    Coordinates are represented in the line's own 3D orthogonal system:
+    lateral vectors are in Cartesian coordinates but perpendicular to AB.
+    """
+    a = positions[start]
+    b = positions[end]
+    v = subtract(b, a)
+    length = distance(a, b)
+    unit = scale(v, 1.0 / length)
+    result = [(0.0, start, (0.0, 0.0, 0.0), 0.0)]
+    for node_id in component:
+        if node_id == start or node_id == end:
+            continue
+        w = subtract(positions[node_id], a)
+        station = dot(w, unit)
+        if station <= 0.0 or station >= length:
+            continue
+        transverse = subtract(w, scale(unit, station))
+        offset = math.sqrt(dot(transverse, transverse))
+        if offset <= radius + pitch * 1.0e-10:
+            result.append((station, node_id, transverse, offset))
+    result.append((length, end, (0.0, 0.0, 0.0), 0.0))
+    result.sort(key=lambda item: (item[0], item[1]))
+    if len(result) > MAX_CANDIDATES:
+        raise ValueError('Too many nearby nodes (%d). Please select a '
+                         'smaller surface region.' % len(result))
+    return result
+
+
+def optimize_row(candidates, pitch, adjacency, length):
+    """Dynamic programming on strictly increasing line stations.
+
+    Unlike mesh-edge Dijkstra, this allows a sensible succession of mesh
+    nodes even if the target line crosses faces at arbitrary angles. The
+    cost penalizes lateral movement, transverse hopping between rows and
+    gaps much larger/smaller than the local mesh pitch.
+    """
+    n = len(candidates)
+    if n < 3:
+        return [candidates[0], candidates[-1]]
+
+    # Target gap approximates local mesh pitch, but don't create unnecessary
+    # close nodes simply because the total segment is short.
+    min_step = max(MIN_STEP_PITCH * pitch, length * 1.0e-10)
+    max_gap = max(MAX_GAP_PITCH * pitch, length * 1.0e-10)
+    infinity = float('inf')
+    best = [infinity] * n
+    predecessor = [-1] * n
+    best[0] = 0.0
+    # Local two-face neighbourhood prevents jumping across folded/overlapping
+    # parts of a surface just because their nodes are close in 3D.
+    neighbourhood_cache = {}
+
+    def local_neighbours(node_id):
+        if node_id not in neighbourhood_cache:
+            direct = adjacency[node_id]
+            near = set(direct)
+            for neighbour in direct:
+                near.update(adjacency[neighbour])
+            neighbourhood_cache[node_id] = near
+        return neighbourhood_cache[node_id]
+
+    # Efficient sliding predecessor window in sorted station order.
+    left = 0
+    for j in range(1, n):
+        s_j, id_j, perp_j, d_j = candidates[j]
+        while left < j and s_j - candidates[left][0] > max_gap:
+            left += 1
+        for i in range(left, j):
+            if best[i] == infinity:
+                continue
+            s_i, id_i, perp_i, d_i = candidates[i]
+            step = s_j - s_i
+            if step < min_step:
+                continue
+            # A selected row must remain continuous on the actual mesh
+            # surface; near in 3D is not enough on folded geometry.
+            near = local_neighbours(id_i)
+            if id_j not in near:
+                continue
+            # Penalize gaps substantially more than short steps. Do not force
+            # one node per target 'column', which fails on diagonal rows.
+            normalized_step = step / pitch
+            gap_cost = 2.0 * max(0.0, normalized_step - 1.1) ** 2
+            short_cost = 0.30 * max(0.0, 0.9 - normalized_step) ** 2
+            # This regularizes transverse switches between equally close rows.
+            lateral_switch = distance(perp_i, perp_j) / pitch
+            switching_cost = 1.4 * lateral_switch ** 2
+            # Indirect neighbours are OK: eventual beams can be created
+            # directly between nodes; don't force stepped mesh-edge paths.
+            neighbourhood_cost = 0.0
+            if id_j not in adjacency[id_i]:
+                neighbourhood_cost = 0.25
+            node_cost = 0.05 + 2.5 * (d_j / pitch) ** 2
+            # Cost of moving only points near the target and keeping a
+            # relatively even spacing along the line.
+            value = (best[i] + gap_cost + short_cost + switching_cost
+                     + neighbourhood_cost + node_cost)
+            if value < best[j] - 1.0e-12:
+                best[j] = value
+                predecessor[j] = i
+    if predecessor[-1] < 0:
         return None
-    path = [end_id]
-    while path[-1] != start_id:
-        path.append(previous[path[-1]])
-    path.reverse()
-    return path
+    indices = []
+    i = n - 1
+    while i >= 0:
+        indices.append(i)
+        i = predecessor[i]
+    indices.reverse()
+    return [candidates[index] for index in indices]
 
 
-def move_node(node_id, xyz):
-    mw.set_node_x(node_id, float(xyz[0]))
-    mw.set_node_y(node_id, float(xyz[1]))
-    mw.set_node_z(node_id, float(xyz[2]))
+def quality_checks(face_lists, positions, selected, updates):
+    """Preflight catastrophic node coincidence from moving a subset.
+
+    Checks distinct vertex pairs in each affected face, not just along the
+    proposed row. This is a conservative heuristic, NOT an FEA quality metric.
+    """
+    min_ratio = 1.0
+    for face in face_lists:
+        if not any(node_id in updates for node_id in face):
+            continue
+        for i in range(len(face)):
+            n1 = face[i]
+            for n2 in face[i + 1:]:
+                original_length = distance(positions[n1], positions[n2])
+                if original_length <= 0.0:
+                    continue
+                after1 = updates.get(n1, positions[n1])
+                after2 = updates.get(n2, positions[n2])
+                ratio = distance(after1, after2) / original_length
+                if ratio < min_ratio:
+                    min_ratio = ratio
+    if min_ratio < MIN_PAIR_DISTANCE_RATIO:
+        raise ValueError('Potentially collapsed element face: a pair of '
+                         'nodes becomes %.1f%% of its original separation. '
+                         'Reduce tolerance, remesh or change endpoints. '
+                         'No nodes moved.' % (100.0 * min_ratio))
+    # On tri3/quad4 faces, also catch near-zero or reversed oriented surface
+    # area. This is a conservative preflight, not a full Jacobian check.
+    def cross(a, b):
+        return (a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0])
+
+    for face in face_lists:
+        if not any(node_id in updates for node_id in face):
+            continue
+        if len(face) not in (3, 4):
+            continue
+        tris = [(face[0], face[1], face[2])]
+        if len(face) == 4:
+            tris.append((face[0], face[2], face[3]))
+        for n0, n1, n2 in tris:
+            original = cross(subtract(positions[n1], positions[n0]),
+                             subtract(positions[n2], positions[n0]))
+            original_sq = dot(original, original)
+            if original_sq <= 1.0e-30:
+                continue
+            p0 = updates.get(n0, positions[n0])
+            p1 = updates.get(n1, positions[n1])
+            p2 = updates.get(n2, positions[n2])
+            current = cross(subtract(p1, p0), subtract(p2, p0))
+            area_ratio = dot(original, current) / original_sq
+            if area_ratio < MIN_ORIENTED_AREA_RATIO:
+                raise ValueError('Selected node movement would collapse or '
+                                 'reverse a surface triangle (signed area '
+                                 'ratio %.3f). Try a smaller radius or '
+                                 'remesh. No nodes moved.' % area_ratio)
+    return min_ratio
 
 
-def render_ids(path):
-    visible = [str(node_id) for node_id in path[:MAX_REPORTED_NODES]]
-    if len(path) > MAX_REPORTED_NODES:
-        visible.append("... +%d more" % (len(path) - MAX_REPORTED_NODES))
-    return " -> ".join(visible)
+def apply_updates(updates, originals):
+    changed = []
+    try:
+        for node_id in sorted(updates):
+            new = updates[node_id]
+            changed.append(node_id)
+            mw.set_node_x(node_id, float(new[0]))
+            mw.set_node_y(node_id, float(new[1]))
+            mw.set_node_z(node_id, float(new[2]))
+    except Exception:
+        # Best-effort rollback; saving a backup first is still essential.
+        for node_id in reversed(changed):
+            old = originals[node_id]
+            try:
+                mw.set_node_x(node_id, float(old[0]))
+                mw.set_node_y(node_id, float(old[1]))
+                mw.set_node_z(node_id, float(old[2]))
+            except Exception:
+                pass
+        raise
 
 
 def main():
     faces = list(mw.selected_faces())
     if not faces:
-        mw.message("Select the MESH FACES of a surface before running this script.\n"
-                   "A CAD geometry face selection is not sufficient.")
+        mw.message('Select the surface MESH FACES first, then run this script. '
+                   'CAD face selection alone does not supply mesh nodes.')
         return
 
-    start_id = read_node_id("Start node ID (on the selected surface):")
-    if start_id is None:
+    start = prompt_node_id('Start node ID on selected surface:')
+    if start is None:
         return
-    end_id = read_node_id("End node ID (on the selected surface):")
-    if end_id is None:
+    end = prompt_node_id('End node ID on selected surface:')
+    if end is None:
         return
-    if start_id == end_id:
-        raise ValueError("Start and end nodes must be different.")
-
-    tolerance_string = mw.input("Maximum distance from line in metres "
-                                "(0 or blank = automatic):")
-    if tolerance_string is None:
+    if start == end:
+        raise ValueError('Start and end nodes must be different.')
+    requested = prompt_radius()
+    if requested is None:
         return
-    if str(tolerance_string).strip() == "":
-        requested_tolerance = 0.0
-    else:
-        try:
-            requested_tolerance = float(str(tolerance_string).strip())
-        except (TypeError, ValueError):
-            raise ValueError("Search tolerance must be a number in metres.")
-    if requested_tolerance < 0.0 or math.isnan(requested_tolerance) or math.isinf(requested_tolerance):
-        raise ValueError("Search tolerance must be finite and nonnegative.")
 
-    graph = surface_graph(faces)
-    if start_id not in graph or end_id not in graph:
-        raise ValueError("Both endpoint nodes must belong to the selected "
-                         "surface MESH FACES. No nodes have been moved.")
+    face_lists, adjacency = make_surface(faces)
+    if start not in adjacency or end not in adjacency:
+        raise ValueError('Both endpoint nodes must belong to the selected '
+                         'surface faces. No nodes moved.')
+    component = component_containing(adjacency, start)
+    if end not in component:
+        raise ValueError('Endpoints are on disconnected selected surface '
+                         'regions. No nodes moved.')
 
-    positions = dict((node_id, node_position(node_id)) for node_id in graph)
-    projection, line_length = projected_data(positions, start_id, end_id)
-    spacing = estimate_spacing(graph, positions)
-    max_offset = requested_tolerance or (AUTO_TOLERANCE_FACTOR * spacing)
-    path = find_path(graph, positions, projection, start_id, end_id,
-                     max_offset, spacing, line_length)
+    positions = dict((node_id, node_location(node_id)) for node_id in component)
+    a, b = positions[start], positions[end]
+    ab = subtract(b, a)
+    length = distance(a, b)
+    if length <= 0.0:
+        raise ValueError('Endpoint nodes have identical coordinates.')
+
+    pitch = estimate_pitch(positions, adjacency, component, ab, a, length)
+    radius = requested if requested else AUTO_RADIUS_PITCH * pitch
+    if radius <= 0:
+        raise ValueError('Mesh pitch and search radius must be positive.')
+    candidates = candidate_points(positions, component, start, end,
+                                  pitch, radius)
+    path = optimize_row(candidates, pitch, adjacency, length)
     if path is None:
-        raise ValueError("No forward-connected node path was found within "
-                         "%.6g m of the line. Try selecting more adjacent "
-                         "surface faces or increasing the tolerance. "
-                         "No nodes have been moved." % max_offset)
-
-    intermediate = path[1:-1]
-    if not intermediate:
-        mw.message("The endpoints share a face and the closest path has "
-                   "no intermediate nodes to move.\n"
-                   "No mesh modification was made.")
+        raise ValueError('No continuous row can be found within the '
+                         'selected radius without large spacing gaps. '
+                         'Increase the radius carefully, or remesh nearer '
+                         'the reference line. No nodes moved.')
+    if len(path) <= 2:
+        mw.message('No intermediate surface nodes are close enough to '
+                   'form an alignment. Nothing changed.')
         return
 
-    move_distances = [projection[node_id][1] for node_id in intermediate]
-    max_move = max(move_distances)
-    mean_move = sum(move_distances) / len(move_distances)
-    warning = ""
-    if max_move > 0.5 * spacing:
-        warning = ("\nWARNING: Maximum move exceeds half the estimated "
-                   "mesh pitch. Check distortion and element quality.")
+    unit = scale(ab, 1.0 / length)
+    updates = {}
+    projected = []
+    for station, node_id, transverse, offset in path[1:-1]:
+        xyz = add(a, scale(unit, station))
+        updates[node_id] = xyz
+        projected.append(offset)
+    minimum_ratio = quality_checks(face_lists, positions, component, updates)
 
-    summary = ("%s v%s\n\n"
-               "Selected faces: %d\n"
-               "Surface nodes: %d\n"
-               "Fixed endpoints: %d -> %d\n"
-               "Line length: %.6g m\n"
-               "Estimated mesh pitch: %.6g m\n"
-               "Search tolerance: %.6g m\n"
-               "Intermediate nodes to move: %d\n"
-               "Maximum move: %.6g m\n"
-               "Average move: %.6g m\n"
-               "Path: %s%s" %
-               (SCRIPT_NAME, VERSION, len(faces), len(graph),
-                start_id, end_id, line_length, spacing, max_offset,
-                len(intermediate), max_move, mean_move,
-                render_ids(path), warning))
+    gaps = [path[i + 1][0] - path[i][0] for i in range(len(path) - 1)]
+    maximum_gap = max(gaps)
+    maximum_move = max(projected)
+    mean_move = sum(projected) / float(len(projected))
+    ids = [str(item[1]) for item in path[:MAX_IDS_SHOWN]]
+    if len(path) > MAX_IDS_SHOWN:
+        ids.append('... (%d more)' % (len(path) - MAX_IDS_SHOWN))
+    warning = ''
+    if maximum_move > 0.45 * pitch:
+        warning += '\nWARNING: Node movements exceed 45% of mesh pitch.'
+    if minimum_ratio < 0.35:
+        warning += '\nWARNING: Some face-node separations shrink substantially.'
 
-    confirmation = mw.input(summary + "\n\nType YES to move these nodes:")
-    if confirmation is None or str(confirmation).strip().upper() != "YES":
-        mw.message("Cancelled. No nodes were moved.")
+    report = ('%s v%s\n\n'
+              'Selected mesh faces: %d\n'
+              'Connected surface nodes: %d\n'
+              'Fixed anchors: %d and %d\n'
+              'Line length: %.6g m\n'
+              'Estimated local mesh pitch: %.6g m\n'
+              'Search radius: %.6g m\n'
+              'Nodes to move: %d\n'
+              'Largest movement: %.6g m\n'
+              'Average movement: %.6g m\n'
+              'Largest beam-node gap: %.6g m\n'
+              'Smallest retained face-node distance ratio: %.3f\n'
+              'Selected node IDs: %s%s' %
+              (SCRIPT_NAME, VERSION, len(faces), len(component),
+               start, end, length, pitch, radius, len(updates),
+               maximum_move, mean_move, maximum_gap, minimum_ratio,
+               ', '.join(ids), warning))
+    answer = mw.input(report + '\n\nType YES to apply (anything else cancels):')
+    if answer is None or str(answer).strip().upper() != 'YES':
+        mw.message('Cancelled. No nodes were moved.')
         return
-
-    # Compute the entire edit in advance; preserve original endpoints.
-    targets = dict((node_id, projection[node_id][2]) for node_id in intermediate)
-    changed = []
-    try:
-        for node_id in intermediate:
-            changed.append(node_id)  # include this node in rollback on failure
-            move_node(node_id, targets[node_id])
-    except Exception:
-        # Best-effort restoration if Mecway rejects an individual coordinate.
-        for node_id in reversed(changed):
-            try:
-                move_node(node_id, positions[node_id])
-            except Exception:
-                pass
-        raise
-
-    mw.message("Moved %d intermediate nodes onto the straight line from "
-               "node %d to node %d. Endpoints unchanged.\n\n"
-               "IMPORTANT: Check mesh distortion/element quality before "
-               "using the mesh for analysis or adding beams.\n\n"
-               "Path: %s" % (len(intermediate), start_id, end_id,
-                              render_ids(path)))
+    apply_updates(updates, positions)
+    mw.message('Aligned %d intermediate surface nodes onto the line '
+               'from %d to %d. Anchors unchanged.\n\n'
+               'The resulting node IDs (in order) are: %s\n\n'
+               'Review element distortion before analysis. Beam elements '
+               'have NOT been created.' %
+               (len(updates), start, end,
+                ', '.join(str(item[1]) for item in path)))
 
 
 try:
     main()
-except Exception as exc:
-    mw.message("%s: %s" % (SCRIPT_NAME, str(exc)))
+except Exception as err:
+    mw.message('%s v%s: %s' % (SCRIPT_NAME, VERSION, str(err)))
