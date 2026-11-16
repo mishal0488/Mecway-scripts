@@ -12,9 +12,13 @@ Mecway-scripts/
 ├── README.md
 ├── scripts/
 │   ├── hello_mecway.py
-│   └── report_selected_nodes.py
+│   ├── report_selected_nodes.py
+│   └── straighten_surface_node_path.py
+├── tests/
+│   └── test_straighten_surface_node_path.py
 └── docs/
-    └── IRONPYTHON_COMPATIBILITY.md
+    ├── IRONPYTHON_COMPATIBILITY.md
+    └── STRAIGHTEN_SURFACE_NODE_PATH.md
 ```
 
 ## Running the scripts in Mecway
@@ -24,6 +28,12 @@ Mecway-scripts/
 3. Choose **Tools → Scripts... → New** and select the desired existing `.py` file in the `scripts` directory.
 4. Save any changes to the script in a text editor. Run it from its entry in Mecway's **Tools** menu.
 5. Start with `hello_mecway.py`, then select a few mesh nodes and run `report_selected_nodes.py`.
+
+### Straighten a path across selected mesh faces
+
+`straighten_surface_node_path.py` locates a connected mesh-node path near a line joining two existing nodes and projects its intermediate nodes onto the line. First select the **mesh faces** of the surface, run the script, enter the two node IDs and a search tolerance in **metres**, then type `YES` after reviewing the proposed changes. Endpoints stay fixed. The operation edits mesh coordinates but **does not create beam elements**.
+
+Save a backup, then inspect mesh distortion and element quality. Full usage and limitations: [Straighten Surface Node Path](docs/STRAIGHTEN_SURFACE_NODE_PATH.md).
 
 Mecway's built-in scripting globals include `mw`, `solution`, `FaceId`, and `Vector`. The available API is documented in **Help → API reference** inside your installed Mecway version.
 
@@ -37,6 +47,10 @@ Mecway's built-in scripting globals include `mw`, `solution`, `FaceId`, and `Vec
 - Check the API reference for the exact installed Mecway version before using version-specific operations.
 
 For compatibility details see [docs/IRONPYTHON_COMPATIBILITY.md](docs/IRONPYTHON_COMPATIBILITY.md).
+
+## Local tests
+
+For logic tests with a simulated Mecway API (using standard CPython), run `python -m unittest discover -s tests -v` from the repository root. These do not replace a live test in Mecway.
 
 ## References
 
