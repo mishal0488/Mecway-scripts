@@ -29,11 +29,11 @@ Mecway-scripts/
 4. Save any changes to the script in a text editor. Run it from its entry in Mecway's **Tools** menu.
 5. Start with `hello_mecway.py`, then select a few mesh nodes and run `report_selected_nodes.py`.
 
-### Straighten a path across selected mesh faces
+### Straighten a path across selected mesh faces (v2.0.0)
 
-`straighten_surface_node_path.py` locates a connected mesh-node path near a line joining two existing nodes and projects its intermediate nodes onto the line. First select the **mesh faces** of the surface, run the script, enter the two node IDs and a search tolerance in **metres**, then type `YES` after reviewing the proposed changes. Endpoints stay fixed. The operation edits mesh coordinates but **does not create beam elements**.
+`straighten_surface_node_path.py` finds a well-spaced, continuous row of surface nodes near the line between two selected node IDs and projects its intermediate nodes onto that line. Version 2 replaces the brittle edge-by-edge path search with a dynamic-programming selection that accommodates irregular meshes and angled lines. First select the **mesh faces** of the surface, run the script, enter the two node IDs and a search tolerance in **metres**, then type `YES` after reviewing the proposed changes. Endpoints stay fixed. The operation edits mesh coordinates but **does not create beam elements**.
 
-Save a backup, then inspect mesh distortion and element quality. Full usage and limitations: [Straighten Surface Node Path](docs/STRAIGHTEN_SURFACE_NODE_PATH.md).
+Save a backup, then inspect mesh distortion and element quality. The script rejects some extreme changes, but these safety tests do not replace a mesh-quality check. Full usage and limitations: [Straighten Surface Node Path](docs/STRAIGHTEN_SURFACE_NODE_PATH.md).
 
 Mecway's built-in scripting globals include `mw`, `solution`, `FaceId`, and `Vector`. The available API is documented in **Help → API reference** inside your installed Mecway version.
 
