@@ -6,6 +6,9 @@ Run: python -m unittest discover -s tests -v
 import os
 import runpy
 import unittest
+import sys
+import types
+from unittest.mock import patch
 
 SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
                                       'scripts', 'straighten_surface_node_path.py'))
@@ -72,16 +75,64 @@ def grid_mesh(cols=5, rows=3, warp=0.10):
     return faces, positions
 
 
-def run_model(faces, positions, replies):
+def run_model(faces, positions, replies, accept=True):
+    """Exercise the modal dialog in CPython with a minimal WinForms fake."""
     fake = FakeMecway(faces, positions, replies)
-    runpy.run_path(SCRIPT, init_globals={'mw': fake})
+    dialog_calls = []
+
+    class Controls(list):
+        def Add(self, widget):
+            self.append(widget)
+
+    class FakeControl(object):
+        pass
+
+    class FakeForm(FakeControl):
+        def __init__(self):
+            self.Controls = Controls()
+
+        def ShowDialog(self):
+            dialog_calls.append(self)
+            return 'OK' if accept else 'Cancel'
+
+        def Dispose(self):
+            pass
+
+    class Consts(object):
+        CenterScreen = 'CenterScreen'
+        FixedDialog = 'FixedDialog'
+        Both = 'Both'
+        OK = 'OK'
+        Cancel = 'Cancel'
+
+    winforms = types.ModuleType('System.Windows.Forms')
+    winforms.Form = FakeForm
+    winforms.TextBox = FakeControl
+    winforms.Button = FakeControl
+    for name in ('FormStartPosition', 'FormBorderStyle', 'ScrollBars', 'DialogResult'):
+        setattr(winforms, name, Consts)
+
+    clr = types.ModuleType('clr')
+    clr.AddReference = lambda assembly: None
+    system = types.ModuleType('System')
+    system.__path__ = []
+    windows = types.ModuleType('System.Windows')
+    windows.__path__ = []
+    modules = {'clr': clr, 'System': system,
+               'System.Windows': windows, 'System.Windows.Forms': winforms}
+    with patch.dict(sys.modules, modules):
+        runpy.run_path(SCRIPT, init_globals={'mw': fake})
+
+    # In successful cases the preview is displayed and the only user
+    # interaction after input is a button click, never an mw.input prompt.
+    fake.dialog_calls = dialog_calls
     return fake
 
 
 class StraightenTests(unittest.TestCase):
     def test_wavy_row_and_other_rows_unchanged(self):
         faces, positions = grid_mesh()
-        mw = run_model(faces, positions, ['1', '5', '0', 'YES'])
+        mw = run_model(faces, positions, ['1', '5', '0'])
         for node_id in range(1, 6):
             self.assertAlmostEqual(mw.positions[node_id][1], 0.0)
         for node_id in range(6, 16):
@@ -92,9 +143,30 @@ class StraightenTests(unittest.TestCase):
 
     def test_user_can_cancel_without_changes(self):
         faces, positions = grid_mesh()
-        mw = run_model(faces, positions, ['1', '5', '0.5', 'NO'])
+        mw = run_model(faces, positions, ['1', '5', '0.5'], accept=False)
         self.assertEqual(mw.writes, [])
         self.assertTrue(any('Cancelled' in msg for msg in mw.messages))
+
+    def test_dialog_has_accept_and_cancel_buttons_and_preview(self):
+        faces, positions = grid_mesh()
+        mw = run_model(faces, positions, ['1', '5', '0'])
+        self.assertEqual(len(mw.dialog_calls), 1)
+        dialog = mw.dialog_calls[0]
+        buttons = [item for item in dialog.Controls if hasattr(item, 'DialogResult')]
+        self.assertEqual([button.Text for button in buttons], ['Accept', 'Cancel'])
+        self.assertEqual(dialog.AcceptButton, buttons[0])
+        self.assertEqual(dialog.CancelButton, buttons[1])
+        self.assertTrue(any('Nodes to move: 3' in widget.Text
+                            for widget in dialog.Controls if hasattr(widget, 'Text')))
+        self.assertFalse(any('Type YES' in msg for msg in mw.messages))
+        # Only the original 3 inputs are needed, no confirmation text prompt.
+        self.assertEqual(mw.replies, [])
+
+    def test_cancel_dialog_shows_without_moving_nodes(self):
+        faces, positions = grid_mesh()
+        mw = run_model(faces, positions, ['1', '5', '0'], accept=False)
+        self.assertEqual(len(mw.dialog_calls), 1)
+        self.assertEqual(mw.writes, [])
 
     def test_selected_face_subset_must_include_both_anchors(self):
         faces, positions = grid_mesh()
@@ -123,7 +195,7 @@ class StraightenTests(unittest.TestCase):
         x = [0.0, 0.85, 1.95, 1.88, 4.2, 5.05, 6.0]
         for i, xx in enumerate(x):
             positions[i + 1] = (xx, positions[i + 1][1], 0.0)
-        mw = run_model(faces, positions, ['1', '7', '0.6', 'YES'])
+        mw = run_model(faces, positions, ['1', '7', '0.6'])
         changed = set(node_id for node_id, axis, val in mw.writes)
         self.assertTrue(changed)
         self.assertNotIn(1, changed)
@@ -134,7 +206,7 @@ class StraightenTests(unittest.TestCase):
 
     def test_diagonal_route_does_not_collapse_duplicate_station(self):
         faces, positions = grid_mesh(cols=6, rows=6, warp=0)
-        mw = run_model(faces, positions, ['1', '36', '1.0', 'YES'])
+        mw = run_model(faces, positions, ['1', '36', '1.0'])
         # At the same longitudinal coordinate x+y, multiple nodes exist;
         # the algorithm must choose no more than one per close station.
         changed = set(node_id for node_id, axis, val in mw.writes)
@@ -169,7 +241,7 @@ class StraightenTests(unittest.TestCase):
         for node_id, xyz in list(positions.items()):
             x, y, z = xyz
             positions[node_id] = (x, y, 0.25 * x + 0.10 * y)
-        mw = run_model(faces, positions, ['1', '7', '0.5', 'YES'])
+        mw = run_model(faces, positions, ['1', '7', '0.5'])
         moved = set(n for n, axis, value in mw.writes)
         self.assertEqual(moved, set(range(2, 7)))
         for n in moved:
@@ -183,7 +255,7 @@ class StraightenTests(unittest.TestCase):
         positions = {1: (0.0, 0.0, 0.0),
                      2: (1.0, 0.6, 0.0),
                      3: (2.0, 0.0, 0.0)}
-        mw = run_model(faces, positions, ['1', '3', '1.0', 'YES'])
+        mw = run_model(faces, positions, ['1', '3', '1.0'])
         self.assertFalse(mw.writes)
         self.assertTrue(any(('collapse' in msg) or
                             ('No intermediate' in msg) for msg in mw.messages),
@@ -191,12 +263,12 @@ class StraightenTests(unittest.TestCase):
 
     def test_selected_node_ids_are_reported_in_order(self):
         faces, positions = grid_mesh()
-        mw = run_model(faces, positions, ['1', '5', '0', 'YES'])
+        mw = run_model(faces, positions, ['1', '5', '0'])
         self.assertTrue(any('1, 2, 3, 4, 5' in msg for msg in mw.messages))
 
     def test_large_mesh_skips_unrelated_other_region(self):
         faces, positions = grid_mesh(cols=18, rows=18, warp=0.05)
-        mw = run_model(faces, positions, ['1', '18', '0', 'YES'])
+        mw = run_model(faces, positions, ['1', '18', '0'])
         self.assertEqual(set(node_id for node_id, axis, val in mw.writes),
                          set(range(2, 18)))
 
