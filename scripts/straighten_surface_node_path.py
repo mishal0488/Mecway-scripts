@@ -2,7 +2,7 @@
 """Align nearby nodes of a user-selected Mecway mesh surface to a 3D line.
 
 Author: Mishal Mohanlal
-Version: 2.0.0
+Version: 2.1.0
 Runtime: Mecway's embedded IronPython 2.7 (no external packages).
 
 This is a geometric row-finding tool, NOT an element-edge-chain finder:
@@ -14,7 +14,7 @@ share element edges.
 2. Select the MESH FACES of the surface where the line is required.
 3. Run script, supply start and end node IDs (both on selected faces).
 4. Give a search radius in METRES (0 = automatic, about one mesh pitch).
-5. Read the preview; type YES to move the identified intermediate nodes.
+5. Inspect the preview and click Accept or Cancel in the dialog.
 
 Endpoints do not move, nor does this script create any elements. Projection
 onto the exact straight line may deform the surrounding mesh, especially if
@@ -24,7 +24,7 @@ it is curved. Inspect the edited mesh before structural analysis.
 import math
 
 SCRIPT_NAME = 'Straighten Surface Node Path'
-VERSION = '2.0.0'
+VERSION = '2.1.0'
 AUTO_RADIUS_PITCH = 1.20
 # Minimum projected spacing between consecutive selected nodes.
 MIN_STEP_PITCH = 0.30
@@ -373,6 +373,69 @@ def apply_updates(updates, originals):
         raise
 
 
+def confirm_alignment(report):
+    """Display a true Accept/Cancel dialog using Windows Forms (IronPython).
+
+    A Cancel click, the X close button, or Escape leaves the model unchanged.
+    Return True only when the user explicitly clicks Accept (or presses Enter).
+    """
+    try:
+        import clr
+        clr.AddReference('System.Windows.Forms')
+        from System.Windows.Forms import (Form, TextBox, Button,
+            FormStartPosition, FormBorderStyle, ScrollBars, DialogResult)
+    except Exception as exc:
+        raise RuntimeError('Cannot open the Windows confirmation dialog: %s. '
+                           'No nodes were moved.' % str(exc))
+
+    dialog = Form()
+    try:
+        dialog.Text = 'Confirm surface node alignment'
+        dialog.StartPosition = FormStartPosition.CenterScreen
+        dialog.FormBorderStyle = FormBorderStyle.FixedDialog
+        dialog.MaximizeBox = False
+        dialog.MinimizeBox = False
+        dialog.Width = 760
+        dialog.Height = 565
+
+        preview = TextBox()
+        preview.Multiline = True
+        preview.ReadOnly = True
+        preview.ScrollBars = ScrollBars.Both
+        preview.WordWrap = False
+        preview.Left = 14
+        preview.Top = 14
+        preview.Width = 716
+        preview.Height = 456
+        preview.Text = report + ('\r\n\r\nClick Accept to move the nodes, '
+                                 'or Cancel to leave the mesh unchanged.')
+
+        accept = Button()
+        accept.Text = 'Accept'
+        accept.Left = 456
+        accept.Top = 480
+        accept.Width = 130
+        accept.Height = 32
+        accept.DialogResult = DialogResult.OK
+
+        cancel = Button()
+        cancel.Text = 'Cancel'
+        cancel.Left = 600
+        cancel.Top = 480
+        cancel.Width = 130
+        cancel.Height = 32
+        cancel.DialogResult = DialogResult.Cancel
+
+        dialog.Controls.Add(preview)
+        dialog.Controls.Add(accept)
+        dialog.Controls.Add(cancel)
+        dialog.AcceptButton = accept
+        dialog.CancelButton = cancel
+        return dialog.ShowDialog() == DialogResult.OK
+    finally:
+        dialog.Dispose()
+
+
 def main():
     faces = list(mw.selected_faces())
     if not faces:
@@ -464,8 +527,7 @@ def main():
                start, end, length, pitch, radius, len(updates),
                maximum_move, mean_move, maximum_gap, minimum_ratio,
                ', '.join(ids), warning))
-    answer = mw.input(report + '\n\nType YES to apply (anything else cancels):')
-    if answer is None or str(answer).strip().upper() != 'YES':
+    if not confirm_alignment(report):
         mw.message('Cancelled. No nodes were moved.')
         return
     apply_updates(updates, positions)
